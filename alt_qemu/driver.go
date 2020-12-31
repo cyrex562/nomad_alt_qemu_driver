@@ -1,12 +1,15 @@
-package hello
+package alt_qemu
 
 import (
 	"context"
 	"fmt"
+	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/consul-template/signals"
@@ -16,14 +19,14 @@ import (
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
-	"github.com/hashicorp/nomad/plugins/shared/structs"
+	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
 
 const (
 	// pluginName is the name of the plugin
 	// this is used for logging and (along with the version) for uniquely
 	// identifying plugin binaries fingerprinted by the client
-	pluginName = "hello-world-example"
+	pluginName = "alt_qemu"
 
 	// pluginVersion allows the client to identify and use newer versions of
 	// an installed plugin
@@ -38,6 +41,14 @@ const (
 	// this is used to allow modification and migration of the task schema
 	// used by the plugin
 	taskHandleVersion = 1
+
+	qemuGracefulShutdownMsg = "system_powerdown\n"
+	qemuMonitorSocketName = "qemu-monitor.sock"
+	qemuLegacyMaxMonitorPathLen = 108
+
+	// The key populated in Node Attributes to indicate presence of the Qemu driver
+	driverAttr        = "driver.qemu"
+	driverVersionAttr = "driver.qemu.version"
 )
 
 var (
@@ -62,15 +73,13 @@ var (
 		//
 		// For example, for the schema below a valid configuration would be:
 		//
-		//   plugin "hello-driver-plugin" {
+		//   plugin "alt_qemu-driver-plugin" {
 		//     config {
 		//       shell = "fish"
 		//     }
 		//   }
-		"shell": hclspec.NewDefault(
-			hclspec.NewAttr("shell", "string", false),
-			hclspec.NewLiteral(`"bash"`),
-		),
+		"image_paths": hclspec.NewAttr("image_paths", "list(string)", false),
+		// TODO: what other elements are needed at the agent config level?
 	})
 
 	// taskConfigSpec is the specification of the plugin's configuration for
@@ -79,6 +88,7 @@ var (
 	// when a job is submitted.
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		// TODO: define plugin's task configuration schema
+		// TODO: identify other constants and things to add to the task config spec
 		//
 		// The schema should be defined using HCL specs and it will be used to
 		// validate the task configuration provided by the user when they
@@ -88,17 +98,20 @@ var (
 		//   job "example" {
 		//     group "example" {
 		//       task "say-hi" {
-		//         driver = "hello-driver-plugin"
+		//         driver = "alt_qemu-driver-plugin"
 		//         config {
 		//           greeting = "Hi"
 		//         }
 		//       }
 		//     }
 		//   }
-		"greeting": hclspec.NewDefault(
-			hclspec.NewAttr("greeting", "string", false),
-			hclspec.NewLiteral(`"Hello, World!"`),
-		),
+		"image_path":        hclspec.NewAttr("image_path", "string", true),
+		"accelerator":       hclspec.NewAttr("accelerator", "string", false),
+		"graceful_shutdown": hclspec.NewAttr("graceful_shutdown", "bool", false),
+		"args":              hclspec.NewAttr("args", "list(string)", false),
+		"port_map":          hclspec.NewAttr("port_map", "list(map(number))", false),
+		"qemu_system_bin":   hclspec.NewAttr("qemu_system_bin", "string", false),
+		"qemu_img_bin":      hclspec.NewAttr("qemu_img_bin", "string", false),
 	})
 
 	// capabilities indicates what optional features this driver supports
@@ -109,9 +122,14 @@ var (
 		// The plugin's capabilities signal Nomad which extra functionalities
 		// are supported. For a list of available options check the docs page:
 		// https://godoc.org/github.com/hashicorp/nomad/plugins/drivers#Capabilities
-		SendSignals: true,
-		Exec:        false,
+		SendSignals:         false,
+		Exec:                false,
+		FSIsolation:         drivers.FSIsolationImage,
+		NetIsolationModes:   nil,
+		MustInitiateNetwork: false,
 	}
+
+	versionRegex = regexp.MustCompile(`version (\d[\.\d+]+)`)
 )
 
 // Config contains configuration information for the plugin
@@ -121,7 +139,7 @@ type Config struct {
 	// This struct is the decoded version of the schema defined in the
 	// configSpec variable above. It's used to convert the HCL configuration
 	// passed by the Nomad agent into Go contructs.
-	Shell string `codec:"shell"`
+	ImagePaths []string `codec:"image_paths"`
 }
 
 // TaskConfig contains configuration information for a task that runs with
@@ -132,7 +150,13 @@ type TaskConfig struct {
 	// This struct is the decoded version of the schema defined in the
 	// taskConfigSpec variable above. It's used to convert the string
 	// configuration for the task into Go contructs.
-	Greeting string `codec:"greeting"`
+	ImagePath        string             `codec:"image_path"`
+	Accelerator      string             `codec:"accelerator"`
+	Args             []string           `codec:"args"`     // extra arguments to qemu executable
+	PortMap          hclutils.MapStrInt `codec:"port_map"` // A map of host port and the port name defined in the image manifest file
+	GracefulShutdown bool               `codec:"graceful_shutdown"`
+	QemuSystemBin    string             `codec:"qemu_system_bin"`
+	QemuImgBin       string             `codec:"qemu_img_bin"`
 }
 
 // TaskState is the runtime state which is encoded in the handle returned to
@@ -140,7 +164,7 @@ type TaskConfig struct {
 // This information is needed to rebuild the task state and handler during
 // recovery.
 type TaskState struct {
-	ReattachConfig *structs.ReattachConfig
+	ReattachConfig *pstructs.ReattachConfig
 	TaskConfig     *drivers.TaskConfig
 	StartedAt      time.Time
 
@@ -152,12 +176,11 @@ type TaskState struct {
 	// will respawn a new instance of the plugin and try to restore its
 	// in-memory representation of the running tasks using the RecoverTask()
 	// method below.
-	Pid int
 }
 
-// HelloDriverPlugin is an example driver plugin. When provisioned in a job,
+// AltQemuDriverPlugin is an example driver plugin. When provisioned in a job,
 // the taks will output a greet specified by the user.
-type HelloDriverPlugin struct {
+type AltQemuDriverPlugin struct {
 	// eventer is used to handle multiplexing of TaskEvents calls such that an
 	// event can be broadcast to all callers
 	eventer *eventer.Eventer
@@ -183,12 +206,12 @@ type HelloDriverPlugin struct {
 	logger hclog.Logger
 }
 
-// NewPlugin returns a new example driver plugin
-func NewPlugin(logger hclog.Logger) drivers.DriverPlugin {
+// NewAltQemuDriver returns a new example driver plugin
+func NewAltQemuDriver(logger hclog.Logger) drivers.DriverPlugin {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger = logger.Named(pluginName)
 
-	return &HelloDriverPlugin{
+	return &AltQemuDriverPlugin{
 		eventer:        eventer.NewEventer(ctx, logger),
 		config:         &Config{},
 		tasks:          newTaskStore(),
@@ -199,17 +222,17 @@ func NewPlugin(logger hclog.Logger) drivers.DriverPlugin {
 }
 
 // PluginInfo returns information describing the plugin.
-func (d *HelloDriverPlugin) PluginInfo() (*base.PluginInfoResponse, error) {
+func (d *AltQemuDriverPlugin) PluginInfo() (*base.PluginInfoResponse, error) {
 	return pluginInfo, nil
 }
 
 // ConfigSchema returns the plugin configuration schema.
-func (d *HelloDriverPlugin) ConfigSchema() (*hclspec.Spec, error) {
+func (d *AltQemuDriverPlugin) ConfigSchema() (*hclspec.Spec, error) {
 	return configSpec, nil
 }
 
 // SetConfig is called by the client to pass the configuration for the plugin.
-func (d *HelloDriverPlugin) SetConfig(cfg *base.Config) error {
+func (d *AltQemuDriverPlugin) SetConfig(cfg *base.Config) error {
 	var config Config
 	if len(cfg.PluginConfig) != 0 {
 		if err := base.MsgPackDecode(cfg.PluginConfig, &config); err != nil {
@@ -227,12 +250,6 @@ func (d *HelloDriverPlugin) SetConfig(cfg *base.Config) error {
 	// string "10s" into a time.Interval) you can do it here and update the
 	// value in d.config.
 	//
-	// In the example below we check if the shell specified by the user is
-	// supported by the plugin.
-	shell := d.config.Shell
-	if shell != "bash" && shell != "fish" {
-		return fmt.Errorf("invalid shell %s", d.config.Shell)
-	}
 
 	// Save the Nomad agent configuration
 	if cfg.AgentConfig != nil {
@@ -248,25 +265,25 @@ func (d *HelloDriverPlugin) SetConfig(cfg *base.Config) error {
 }
 
 // TaskConfigSchema returns the HCL schema for the configuration of a task.
-func (d *HelloDriverPlugin) TaskConfigSchema() (*hclspec.Spec, error) {
+func (d *AltQemuDriverPlugin) TaskConfigSchema() (*hclspec.Spec, error) {
 	return taskConfigSpec, nil
 }
 
 // Capabilities returns the features supported by the driver.
-func (d *HelloDriverPlugin) Capabilities() (*drivers.Capabilities, error) {
+func (d *AltQemuDriverPlugin) Capabilities() (*drivers.Capabilities, error) {
 	return capabilities, nil
 }
 
 // Fingerprint returns a channel that will be used to send health information
 // and other driver specific node attributes.
-func (d *HelloDriverPlugin) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprint, error) {
+func (d *AltQemuDriverPlugin) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprint, error) {
 	ch := make(chan *drivers.Fingerprint)
 	go d.handleFingerprint(ctx, ch)
 	return ch, nil
 }
 
 // handleFingerprint manages the channel and the flow of fingerprint data.
-func (d *HelloDriverPlugin) handleFingerprint(ctx context.Context, ch chan<- *drivers.Fingerprint) {
+func (d *AltQemuDriverPlugin) handleFingerprint(ctx context.Context, ch chan<- *drivers.Fingerprint) {
 	defer close(ch)
 
 	// Nomad expects the initial fingerprint to be sent immediately
@@ -287,9 +304,9 @@ func (d *HelloDriverPlugin) handleFingerprint(ctx context.Context, ch chan<- *dr
 }
 
 // buildFingerprint returns the driver's fingerprint data
-func (d *HelloDriverPlugin) buildFingerprint() *drivers.Fingerprint {
-	fp := &drivers.Fingerprint{
-		Attributes:        map[string]*structs.Attribute{},
+func (d *AltQemuDriverPlugin) buildFingerprint() *drivers.Fingerprint {
+	fingerprint := &drivers.Fingerprint{
+		Attributes:        map[string]*pstructs.Attribute{},
 		Health:            drivers.HealthStateHealthy,
 		HealthDescription: drivers.DriverHealthy,
 	}
@@ -310,33 +327,36 @@ func (d *HelloDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 	//
 	// In the example below we check if the shell specified by the user exists
 	// in the node.
-	shell := d.config.Shell
-
-	cmd := exec.Command("which", shell)
-	if err := cmd.Run(); err != nil {
-		return &drivers.Fingerprint{
-			Health:            drivers.HealthStateUndetected,
-			HealthDescription: fmt.Sprintf("shell %s not found", shell),
-		}
+	bin := "qemu-system-x86_64"
+	if runtime.GOOS == "windows" {
+		// On windows, the "qemu-system-x86_64" command does not respond to the
+		// version flag.
+		bin = "qemu-img"
 	}
-
-	// We also set the shell and its version as attributes
-	cmd = exec.Command(shell, "--version")
-	if out, err := cmd.Output(); err != nil {
-		d.logger.Warn("failed to find shell version: %v", err)
-	} else {
-		re := regexp.MustCompile("[0-9]\\.[0-9]\\.[0-9]")
-		version := re.FindString(string(out))
-
-		fp.Attributes["driver.hello.shell_version"] = structs.NewStringAttribute(version)
-		fp.Attributes["driver.hello.shell"] = structs.NewStringAttribute(shell)
+	outBytes, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		// return no error, as it isn't an error to not find qemu, it just means we
+		// can't use it.
+		fingerprint.Health = drivers.HealthStateUndetected
+		fingerprint.HealthDescription = ""
+		return fingerprint
 	}
+	out := strings.TrimSpace(string(outBytes))
 
-	return fp
+	matches := versionRegex.FindStringSubmatch(out)
+	if len(matches) != 2 {
+		fingerprint.Health = drivers.HealthStateUndetected
+		fingerprint.HealthDescription = fmt.Sprintf("Failed to parse qemu version from %v", out)
+		return fingerprint
+	}
+	currentQemuVersion := matches[1]
+	fingerprint.Attributes[driverAttr] = pstructs.NewBoolAttribute(true)
+	fingerprint.Attributes[driverVersionAttr] = pstructs.NewStringAttribute(currentQemuVersion)
+	return fingerprint
 }
 
 // StartTask returns a task handle and a driver network if necessary.
-func (d *HelloDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
+func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
 	if _, ok := d.tasks.Get(cfg.ID); ok {
 		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
 	}
@@ -417,18 +437,24 @@ func (d *HelloDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHan
 }
 
 // RecoverTask recreates the in-memory state of a task from a TaskHandle.
-func (d *HelloDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
+func (d *AltQemuDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 	if handle == nil {
 		return fmt.Errorf("error: handle cannot be nil")
 	}
 
 	if _, ok := d.tasks.Get(handle.Config.ID); ok {
+		d.logger.Trace("nothing to recover; task already exists",
+			"task_id", handle.Config.ID,
+			"task_name", handle.Config.Name,
+			)
 		return nil
 	}
 
 	var taskState TaskState
 	if err := handle.GetDriverState(&taskState); err != nil {
-		return fmt.Errorf("failed to decode task state from handle: %v", err)
+		msg := fmt.Sprintf("failed to decode taskConfig state from handle: %v", err)
+		d.logger.Error(msg, "error", err, "task_id", handle.Config.ID)
+		return fmt.Errorf(msg)
 	}
 
 	var driverConfig TaskConfig
@@ -470,7 +496,7 @@ func (d *HelloDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 }
 
 // WaitTask returns a channel used to notify Nomad when a task exits.
-func (d *HelloDriverPlugin) WaitTask(ctx context.Context, taskID string) (<-chan *drivers.ExitResult, error) {
+func (d *AltQemuDriverPlugin) WaitTask(ctx context.Context, taskID string) (<-chan *drivers.ExitResult, error) {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return nil, drivers.ErrTaskNotFound
@@ -481,7 +507,7 @@ func (d *HelloDriverPlugin) WaitTask(ctx context.Context, taskID string) (<-chan
 	return ch, nil
 }
 
-func (d *HelloDriverPlugin) handleWait(ctx context.Context, handle *taskHandle, ch chan *drivers.ExitResult) {
+func (d *AltQemuDriverPlugin) handleWait(ctx context.Context, handle *taskHandle, ch chan *drivers.ExitResult) {
 	defer close(ch)
 	var result *drivers.ExitResult
 
@@ -519,7 +545,7 @@ func (d *HelloDriverPlugin) handleWait(ctx context.Context, handle *taskHandle, 
 }
 
 // StopTask stops a running task with the given signal and within the timeout window.
-func (d *HelloDriverPlugin) StopTask(taskID string, timeout time.Duration, signal string) error {
+func (d *AltQemuDriverPlugin) StopTask(taskID string, timeout time.Duration, signal string) error {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return drivers.ErrTaskNotFound
@@ -545,7 +571,7 @@ func (d *HelloDriverPlugin) StopTask(taskID string, timeout time.Duration, signa
 }
 
 // DestroyTask cleans up and removes a task that has terminated.
-func (d *HelloDriverPlugin) DestroyTask(taskID string, force bool) error {
+func (d *AltQemuDriverPlugin) DestroyTask(taskID string, force bool) error {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return drivers.ErrTaskNotFound
@@ -576,7 +602,7 @@ func (d *HelloDriverPlugin) DestroyTask(taskID string, force bool) error {
 }
 
 // InspectTask returns detailed status information for the referenced taskID.
-func (d *HelloDriverPlugin) InspectTask(taskID string) (*drivers.TaskStatus, error) {
+func (d *AltQemuDriverPlugin) InspectTask(taskID string) (*drivers.TaskStatus, error) {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return nil, drivers.ErrTaskNotFound
@@ -586,7 +612,7 @@ func (d *HelloDriverPlugin) InspectTask(taskID string) (*drivers.TaskStatus, err
 }
 
 // TaskStats returns a channel which the driver should send stats to at the given interval.
-func (d *HelloDriverPlugin) TaskStats(ctx context.Context, taskID string, interval time.Duration) (<-chan *drivers.TaskResourceUsage, error) {
+func (d *AltQemuDriverPlugin) TaskStats(ctx context.Context, taskID string, interval time.Duration) (<-chan *drivers.TaskResourceUsage, error) {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return nil, drivers.ErrTaskNotFound
@@ -604,13 +630,13 @@ func (d *HelloDriverPlugin) TaskStats(ctx context.Context, taskID string, interv
 }
 
 // TaskEvents returns a channel that the plugin can use to emit task related events.
-func (d *HelloDriverPlugin) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, error) {
+func (d *AltQemuDriverPlugin) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, error) {
 	return d.eventer.TaskEvents(ctx)
 }
 
 // SignalTask forwards a signal to a task.
 // This is an optional capability.
-func (d *HelloDriverPlugin) SignalTask(taskID string, signal string) error {
+func (d *AltQemuDriverPlugin) SignalTask(taskID string, signal string) error {
 	handle, ok := d.tasks.Get(taskID)
 	if !ok {
 		return drivers.ErrTaskNotFound
@@ -633,7 +659,7 @@ func (d *HelloDriverPlugin) SignalTask(taskID string, signal string) error {
 
 // ExecTask returns the result of executing the given command inside a task.
 // This is an optional capability.
-func (d *HelloDriverPlugin) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
+func (d *AltQemuDriverPlugin) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
 	// TODO: implement driver specific logic to execute commands in a task.
 	return nil, fmt.Errorf("This driver does not support exec")
 }

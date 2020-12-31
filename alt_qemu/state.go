@@ -1,4 +1,4 @@
-package hello
+package alt_qemu
 
 import (
 	"sync"

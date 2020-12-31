@@ -1,7 +1,6 @@
-// TODO: update the module path below to match your own repository
-module github.com/hashicorp/nomad-skeleton-driver-plugin
+module github.com/cyrex562/nomad_alt_qemu_driver
 
-go 1.12
+go 1.15
 
 require (
 	github.com/LK4D4/joincontext v0.0.0-20171026170139-1724345da6d5 // indirect
