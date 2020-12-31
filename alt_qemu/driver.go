@@ -3,6 +3,7 @@ package alt_qemu
 import (
 	"context"
 	"fmt"
+	"github.com/hashicorp/nomad/client/taskenv"
 	"github.com/hashicorp/nomad/helper/pluginutils/hclutils"
 	"os"
 	"os/exec"
@@ -112,6 +113,8 @@ var (
 		"port_map":          hclspec.NewAttr("port_map", "list(map(number))", false),
 		"qemu_system_bin":   hclspec.NewAttr("qemu_system_bin", "string", false),
 		"qemu_img_bin":      hclspec.NewAttr("qemu_img_bin", "string", false),
+		"vm_name": hclspec.NewAttr("vm_name", "string", false),
+		"machine_type": hclspec.NewAttr("machine_type", "string", false),
 	})
 
 	// capabilities indicates what optional features this driver supports
@@ -157,6 +160,8 @@ type TaskConfig struct {
 	GracefulShutdown bool               `codec:"graceful_shutdown"`
 	QemuSystemBin    string             `codec:"qemu_system_bin"`
 	QemuImgBin       string             `codec:"qemu_img_bin"`
+	VmName string `codec:"vm_name"`
+	MachineType string `codec:"machine_type"`
 }
 
 // TaskState is the runtime state which is encoded in the handle returned to
@@ -167,6 +172,7 @@ type TaskState struct {
 	ReattachConfig *pstructs.ReattachConfig
 	TaskConfig     *drivers.TaskConfig
 	StartedAt      time.Time
+	Pid int
 
 	// TODO: add any extra important values that must be persisted in order
 	// to restore a task.
@@ -355,6 +361,17 @@ func (d *AltQemuDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 	return fingerprint
 }
 
+// GetAbsolutePath returns the absolute path of the passed binary by resolving
+// it in the path and following symlinks.
+func GetAbsolutePath(bin string) (string, error) {
+	lp, err := exec.LookPath(bin)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path to %q executable: %v", bin, err)
+	}
+
+	return filepath.EvalSymlinks(lp)
+}
+
 // StartTask returns a task handle and a driver network if necessary.
 func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
 	if _, ok := d.tasks.Get(cfg.ID); ok {
@@ -362,13 +379,109 @@ func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 	}
 
 	var driverConfig TaskConfig
+
 	if err := cfg.DecodeDriverConfig(&driverConfig); err != nil {
 		return nil, nil, fmt.Errorf("failed to decode driver config: %v", err)
 	}
 
 	d.logger.Info("starting task", "driver_cfg", hclog.Fmt("%+v", driverConfig))
+
+	cfg.Env = taskenv.SetPortMapEnvs(cfg.Env, driverConfig.PortMap)
+
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
+
+	// get the image source
+	vmPath := driverConfig.ImagePath
+	if vmPath == "" {
+		return nil, nil, fmt.Errorf("image_path must be set")
+	}
+
+	vmID := driverConfig.VmName
+	if vmID == "" {
+		vmID = filepath.Base(vmPath)
+	}
+
+	if !isAllowedImagePath(d.config.ImagePaths, cfg.AllocDir, vmPath) {
+		return nil, nil, fmt.Errorf("image_path is not in the allowed paths")
+	}
+
+	// parse configuration arugments
+	// create the base arguments
+	accelerator := "tcg"
+	if driverConfig.Accelerator != "" {
+		accelerator = driverConfig.Accelerator
+	}
+
+	mb := cfg.Resources.NomadResources.Memory.MemoryMB
+	if mb < 128 || mb > 4000000 {
+		return nil, nil, fmt.Errorf("qemu memory assignment out of bounds")
+	}
+	mem := fmt.Sprintf("#{mb}M")
+
+	// TODO: this checks for a cpu share out of reasonable bounds. determine the minimum share amount and maximum
+	// possible share amount. Divide the number of shares by 1000 to determine the number of vCPUs to allocate
+	cpuCount := 0
+	cpu := cfg.Resources.NomadResources.Cpu.CpuShares
+	if cpu < 100 || cpu > 1024000 {
+		return nil, nil, fmt.Errorf("cpu share assignment out of bounds")
+	} else if cpu < 1000 {
+		cpuCount = 1
+	} else {
+		cpuCount = int(cpu / 1000)
+	}
+	cpuCountStr := fmt.Sprintf("#{cpuCount}")
+
+	qemuSysPath := driverConfig.QemuSystemBin
+	if qemuSysPath == "" {
+		qemuSysPath = "qemu-system-x86_64"
+	}
+	absPath, err := GetAbsolutePath(qemuSysPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	machineType := driverConfig.MachineType
+	if machineType == "" {
+		machineType = "pc"
+	}
+
+	cpuType := driverConfig.CpuType
+	if cpuType == "" {
+		cpuType = "host"
+	}
+
+	// TODO: netdev type
+	netdevType := "bridge"
+	netdevID := "nd0"
+
+	bootBlockDevName := "bootbd"
+	bootBlockDevDriver := "qcow2"
+	bootBlockDevFileDriver := "file"
+	bootDeviceType := "virtio-blk"
+
+	// TODO: options other than nographic?
+	// TODO: blockdev paths, including disk format
+	// TODO: vnc vs spice
+	// TODO: support multiple block devs
+	// TODO: support CDROM/DVD drive
+	// TODO:
+
+	args := []string {
+		absPath,
+		"-machine", fmt.Sprintf("type=#{machineType},accel=#{accelerator}"),
+		"-name", vmID,
+		"-m", mem,
+		"-cpu", cpuType,
+		"-smp", cpuCountStr,
+		"-nographic",
+		"-blockdev", fmt.Sprintf("node-name=#{bootBlockDevName},driver=#{bootBlockDevDriver},file.filename=#{vmPath},file.locking=off,file.driver=#{bootBlockDevFileDriver}"),
+		"-device", fmt.Sprintf("#{bootDeviceType},drive=#{bootBlockDevName}"),
+		"-netdev", fmt.Sprintf("#{netdevType},id=#{netdevID}"),
+
+		netdevType + ",model=bridge"
+		"-device"
+	}
 
 	// TODO: implement driver specific mechanism to start the task.
 	//
@@ -459,6 +572,8 @@ func (d *AltQemuDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 
 	var driverConfig TaskConfig
 	if err := taskState.TaskConfig.DecodeDriverConfig(&driverConfig); err != nil {
+		msg := fmt.Sprintf("faield to decode driver config: #{err}")
+		d.logger.Error(msg, "error", err, "task_id", handle.Config.ID)
 		return fmt.Errorf("failed to decode driver config: %v", err)
 	}
 
@@ -469,14 +584,17 @@ func (d *AltQemuDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 	//
 	// In the example below we use the executor to re-attach to the process
 	// that was created when the task first started.
-	plugRC, err := structs.ReattachConfigToGoPlugin(taskState.ReattachConfig)
+	plugRC, err := pstructs.ReattachConfigToGoPlugin(taskState.ReattachConfig)
 	if err != nil {
-		return fmt.Errorf("failed to build ReattachConfig from taskConfig state: %v", err)
+		msg := fmt.Sprintf("failed to build ReattachConfig from taskConfig state: #{err}")
+		d.logger.Error(msg, "error", err, "task_id", handle.Config.ID)
+		return fmt.Errorf(msg)
 	}
 
-	execImpl, pluginClient, err := executor.ReattachToExecutor(plugRC, d.logger)
+	execImpl, pluginClient, err := executor.ReattachToExecutor(plugRC, d.logger.With("task_name", handle.Config.Name, "alloc_id", handle.Config.AllocID))
 	if err != nil {
-		return fmt.Errorf("failed to reattach to executor: %v", err)
+		d.logger.Error("failed to reattach to executor", "error", err, "task_id", handle.Config.ID)
+		return fmt.Errorf("failed to reattach to executor: #{err}")
 	}
 
 	h := &taskHandle{
@@ -487,12 +605,36 @@ func (d *AltQemuDriverPlugin) RecoverTask(handle *drivers.TaskHandle) error {
 		procState:    drivers.TaskStateRunning,
 		startedAt:    taskState.StartedAt,
 		exitResult:   &drivers.ExitResult{},
+		logger: d.logger,
 	}
 
 	d.tasks.Set(taskState.TaskConfig.ID, h)
 
 	go h.run()
 	return nil
+}
+
+func isAllowedImagePath(allowedPaths []string, allocDir, imagePath string) bool {
+	if !filepath.IsAbs(imagePath) {
+		imagePath = filepath.Join(allocDir, imagePath)
+	}
+
+	isParent := func(parent, path string) bool {
+		rel, err := filepath.Rel(parent, path)
+		return err == nill && !strings.HasPrefix(rel, "..")
+	}
+
+	if isParent(allocDir, imagePath) {
+		return true
+	}
+
+	for _, ap := range allowedPaths {
+		if isParent(ap, imagePath) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // WaitTask returns a channel used to notify Nomad when a task exits.
