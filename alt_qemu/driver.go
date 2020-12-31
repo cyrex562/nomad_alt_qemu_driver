@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"text/template"
 
 	"github.com/hashicorp/consul-template/signals"
 	"github.com/hashicorp/go-hclog"
@@ -413,11 +414,11 @@ func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 		accelerator = driverConfig.Accelerator
 	}
 
-	mb := cfg.Resources.NomadResources.Memory.MemoryMB
-	if mb < 128 || mb > 4000000 {
+	memMb := cfg.Resources.NomadResources.Memory.MemoryMB
+	if memMb < 128 || memMb > 4000000 {
 		return nil, nil, fmt.Errorf("qemu memory assignment out of bounds")
 	}
-	mem := fmt.Sprintf("#{mb}M")
+	mem := fmt.Sprintf("%dM", memMb)
 
 	// TODO: this checks for a cpu share out of reasonable bounds. determine the minimum share amount and maximum
 	// possible share amount. Divide the number of shares by 1000 to determine the number of vCPUs to allocate
@@ -430,7 +431,7 @@ func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 	} else {
 		cpuCount = int(cpu / 1000)
 	}
-	cpuCountStr := fmt.Sprintf("#{cpuCount}")
+	cpuCountStr := fmt.Sprintf("%d", cpuCount)
 
 	qemuSysPath := driverConfig.QemuSystemBin
 	if qemuSysPath == "" {
@@ -454,7 +455,6 @@ func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 	// TODO: netdev type
 	netdevType := "bridge"
 	netdevID := "nd0"
-
 	bootBlockDevName := "bootbd"
 	bootBlockDevDriver := "qcow2"
 	bootBlockDevFileDriver := "file"
@@ -469,18 +469,16 @@ func (d *AltQemuDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 
 	args := []string {
 		absPath,
-		"-machine", fmt.Sprintf("type=#{machineType},accel=#{accelerator}"),
+		"-machine", fmt.Sprintf("type=%s,accel=%s", machineType, accelerator),
 		"-name", vmID,
 		"-m", mem,
 		"-cpu", cpuType,
 		"-smp", cpuCountStr,
 		"-nographic",
-		"-blockdev", fmt.Sprintf("node-name=#{bootBlockDevName},driver=#{bootBlockDevDriver},file.filename=#{vmPath},file.locking=off,file.driver=#{bootBlockDevFileDriver}"),
-		"-device", fmt.Sprintf("#{bootDeviceType},drive=#{bootBlockDevName}"),
-		"-netdev", fmt.Sprintf("#{netdevType},id=#{netdevID}"),
-
-		netdevType + ",model=bridge"
-		"-device"
+		"-blockdev", fmt.Sprintf("node-name=%s,driver=#%s,file.filename=%s,file.locking=off,file.driver=%s", bootBlockDevName, bootBlockDevDriver, vmPath, bootBlockDevFileDriver),
+		"-device", fmt.Sprintf("%s,drive=%s", bootDeviceType, bootBlockDevName),
+		"-netdev", fmt.Sprintf("%s,id=%s", netdevType, netdevID),
+		"-device", fmt.Sprintf(""),
 	}
 
 	// TODO: implement driver specific mechanism to start the task.
